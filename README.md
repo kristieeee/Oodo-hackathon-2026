@@ -11,3 +11,6 @@
 - Admin: admin@brightloop.com
 - Staff: staff@brightloop.com
 - Customer: customer@brightloop.com
+Live demo: https://YOUR-VERCEL-LINK.vercel.app
+Logins (password Admin@1234): admin@brightloop.com, staff@brightloop.com, customer@brightloop.com
+Note: the backend runs on a free server that sleeps when idle, so the first load can take about 50 seconds.
