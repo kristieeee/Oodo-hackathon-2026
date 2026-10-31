@@ -7,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const db = require('./db');
 
 const app = express();
-const port = 4000;
+const port = process.env.PORT || 4000;
 const jwtSecret = process.env.JWT_SECRET;
 
 if (!jwtSecret) {
