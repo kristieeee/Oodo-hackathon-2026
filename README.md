@@ -1,5 +1,7 @@
 # Brightloop Subscription Management
 
+**Demo video (full walkthrough):** https://drive.google.com/file/d/1HRRzRXcMqIFMUsIBwiDfNO6ZgdXU05US/view?usp=sharing
+
 **Live demo:** https://oodo-hackathon-2026.vercel.app
 
 Note: the backend runs on a free server that sleeps when idle, so the first load can take about 50 seconds.
