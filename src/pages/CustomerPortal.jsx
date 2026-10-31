@@ -1,0 +1,13 @@
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+import { useAuth } from '../context/AuthContext'
+
+function CustomerPortal({ view = 'overview' }) {
+  const { token } = useAuth(); const [subscriptions, setSubscriptions] = useState([]); const [invoices, setInvoices] = useState([]); const [error, setError] = useState('')
+  useEffect(() => { Promise.all([api('/api/my/subscriptions', { token }), api('/api/my/invoices', { token })]).then(([subscriptionData, invoiceData]) => { setSubscriptions(subscriptionData.subscriptions); setInvoices(invoiceData.invoices) }).catch((requestError) => setError(requestError.message)) }, [])
+  const active = subscriptions.filter((subscription) => subscription.status === 'ACTIVE').length; const outstanding = invoices.filter((invoice) => !['PAID', 'CANCELLED'].includes(invoice.status)).reduce((total, invoice) => total + invoice.total, 0)
+  const title = view === 'subscriptions' ? 'My subscriptions' : view === 'invoices' ? 'My invoices' : 'Your account, at a glance.'
+  const visible = view === 'subscriptions' ? subscriptions : view === 'invoices' ? invoices : []
+  return <div className="management-page customer-portal"><header className="topbar"><div><p className="eyebrow">CUSTOMER PORTAL</p><h1>{title}</h1></div></header>{error && <p className="form-error">{error}</p>}{view === 'overview' ? <section className="metric-grid dashboard-metrics"><article><p>ACTIVE SUBSCRIPTIONS</p><strong>{active}</strong><span>Services currently renewing</span></article><article><p>OPEN BALANCE</p><strong>₹{outstanding.toFixed(0)}</strong><span>Across unpaid invoices</span></article><article><p>INVOICES</p><strong>{invoices.length}</strong><span>Available billing records</span></article></section> : <div className="data-table-wrap customer-table"><table className="data-table"><thead><tr>{view === 'subscriptions' ? <><th>Number</th><th>Plan</th><th>Starts</th><th>Next billing</th><th>Status</th></> : <><th>Invoice</th><th>Period</th><th>Due date</th><th>Total</th><th>Status</th></>}</tr></thead><tbody>{visible.length ? visible.map((item) => view === 'subscriptions' ? <tr key={item.id}><td>{item.number}</td><td>{item.plan_name}</td><td>{item.start_date}</td><td>{item.next_billing_date || '—'}</td><td><span className={`status-badge status-${item.status.toLowerCase()}`}>{item.status}</span></td></tr> : <tr key={item.id}><td>INV-{String(item.id).padStart(4, '0')}</td><td>{item.period_start}</td><td>{item.due_date}</td><td>₹{item.total.toFixed(2)}</td><td><span className={`status-badge status-${item.status.toLowerCase()}`}>{item.status}</span></td></tr>) : <tr><td colSpan="5">Nothing to show yet.</td></tr>}</tbody></table></div>}</div>
+}
+export default CustomerPortal

@@ -166,6 +166,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_invoices_customer_status ON invoices(customer_id, status);
   CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date);
   CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
+  CREATE INDEX IF NOT EXISTS idx_subscriptions_status_billing_customer ON subscriptions(status, next_billing_date, customer_id);
+  CREATE INDEX IF NOT EXISTS idx_invoices_status_due_customer ON invoices(status, due_date, customer_id);
 `);
 
 const templateColumns = db.prepare("PRAGMA table_info(quotation_templates)").all();

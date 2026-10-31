@@ -345,6 +345,147 @@ app.post('/api/subscriptions/:id/transition', ...staffOrAdmin, (req, res) => {
   return res.json({ subscription: subscriptionWithLines(db.prepare(`SELECT s.*, u.name AS customer_name, u.email AS customer_email, p.name AS plan_name FROM subscriptions s JOIN users u ON u.id=s.customer_id JOIN plans p ON p.id=s.plan_id WHERE s.id=?`).get(subscription.id)) });
 });
 
+function toDate(value) { return new Date(`${value}T00:00:00Z`); }
+function isoDate(date) { return date.toISOString().slice(0, 10); }
+function advanceBillingDate(value, period) {
+  const date = toDate(value);
+  if (period === 'DAILY') date.setUTCDate(date.getUTCDate() + 1);
+  if (period === 'WEEKLY') date.setUTCDate(date.getUTCDate() + 7);
+  if (period === 'MONTHLY') date.setUTCMonth(date.getUTCMonth() + 1);
+  if (period === 'YEARLY') date.setUTCFullYear(date.getUTCFullYear() + 1);
+  return isoDate(date);
+}
+function dueDateFromTerms(periodStart, terms) {
+  const matches = String(terms || '').match(/\d+/);
+  const days = matches ? Number(matches[0]) : 0;
+  const date = toDate(periodStart); date.setUTCDate(date.getUTCDate() + days);
+  return isoDate(date);
+}
+function validDiscounts(today) {
+  return db.prepare(`SELECT * FROM discounts WHERE (start_date IS NULL OR start_date <= ?) AND (end_date IS NULL OR end_date >= ?)
+    AND (usage_limit IS NULL OR used_count < usage_limit)`).all(today, today);
+}
+function discountAmount(discount, base, quantity) {
+  if ((discount.min_purchase !== null && base < discount.min_purchase) || (discount.min_quantity !== null && quantity < discount.min_quantity)) return 0;
+  return Math.min(base, discount.type === 'PERCENTAGE' ? base * discount.value / 100 : discount.value);
+}
+function invoiceWithDetails(invoice) {
+  if (!invoice) return null;
+  const lines = db.prepare('SELECT * FROM invoice_lines WHERE invoice_id=? ORDER BY id').all(invoice.id);
+  const payments = db.prepare('SELECT * FROM payments WHERE invoice_id=? ORDER BY payment_date, id').all(invoice.id);
+  return { ...invoice, lines, payments, paid_total: payments.reduce((total, payment) => total + payment.amount, 0) };
+}
+
+app.post('/api/billing/run', ...staffOrAdmin, (req, res, next) => {
+  try {
+    const today = req.body.date || isoDate(new Date());
+    const runBilling = db.transaction(() => {
+      const subscriptions = db.prepare(`SELECT s.*, p.billing_period FROM subscriptions s JOIN plans p ON p.id=s.plan_id
+        WHERE s.status='ACTIVE' AND s.next_billing_date IS NOT NULL AND s.next_billing_date <= ?`).all(today);
+      let created = 0; let skipped = 0;
+      const createInvoice = db.prepare(`INSERT INTO invoices (subscription_id, customer_id, period_start, period_end, status, subtotal, tax_total, discount_total, total, due_date)
+        VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)`);
+      const createLine = db.prepare(`INSERT INTO invoice_lines (invoice_id, product_id, product_variant_id, description, quantity, unit_price, tax_rate, tax_amount, discount_amount, amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const incrementDiscount = db.prepare('UPDATE discounts SET used_count=used_count+1 WHERE id=?');
+      for (const subscription of subscriptions) {
+        const duplicate = db.prepare('SELECT 1 FROM invoices WHERE subscription_id=? AND period_start=?').get(subscription.id, subscription.next_billing_date);
+        if (duplicate) { skipped += 1; continue; }
+        const lines = db.prepare(`SELECT sl.*, t.rate AS tax_rate FROM subscription_lines sl LEFT JOIN taxes t ON t.id=sl.tax_id WHERE sl.subscription_id=?`).all(subscription.id);
+        if (!lines.length) { skipped += 1; continue; }
+        const subtotal = lines.reduce((sum, line) => sum + line.amount, 0);
+        const quantity = lines.reduce((sum, line) => sum + line.quantity, 0);
+        const discounts = validDiscounts(today);
+        const subscriptionDiscounts = discounts.filter((discount) => discount.applies_to === 'SUBSCRIPTION');
+        const lineDiscounts = discounts.filter((discount) => discount.applies_to === 'PRODUCT');
+        const calculations = lines.map((line) => {
+          let discount = 0;
+          for (const rule of lineDiscounts.filter((rule) => rule.product_id === line.product_id)) discount += discountAmount(rule, line.amount, line.quantity);
+          for (const rule of subscriptionDiscounts) discount += discountAmount(rule, subtotal, quantity) * (line.amount / subtotal);
+          discount = Math.min(line.amount, discount);
+          const taxAmount = (line.amount - discount) * ((line.tax_rate || 0) / 100);
+          return { ...line, discount, taxAmount };
+        });
+        const discountTotal = calculations.reduce((sum, line) => sum + line.discount, 0);
+        const taxTotal = calculations.reduce((sum, line) => sum + line.taxAmount, 0);
+        const periodStart = subscription.next_billing_date;
+        const result = createInvoice.run(subscription.id, subscription.customer_id, periodStart, advanceBillingDate(periodStart, subscription.billing_period), subtotal, taxTotal, discountTotal, subtotal - discountTotal + taxTotal, dueDateFromTerms(periodStart, subscription.payment_terms));
+        for (const line of calculations) createLine.run(result.lastInsertRowid, line.product_id, line.product_variant_id, line.description || 'Subscription line', line.quantity, line.unit_price, line.tax_rate || 0, line.taxAmount, line.discount, line.amount - line.discount + line.taxAmount);
+        const used = new Set();
+        for (const rule of subscriptionDiscounts) if (discountAmount(rule, subtotal, quantity) > 0) used.add(rule.id);
+        for (const line of lines) for (const rule of lineDiscounts.filter((rule) => rule.product_id === line.product_id)) if (discountAmount(rule, line.amount, line.quantity) > 0) used.add(rule.id);
+        for (const id of used) incrementDiscount.run(id);
+        db.prepare('UPDATE subscriptions SET next_billing_date=? WHERE id=?').run(advanceBillingDate(periodStart, subscription.billing_period), subscription.id);
+        created += 1;
+      }
+      return { created, skipped };
+    });
+    return res.json(runBilling());
+  } catch (error) { return next(error); }
+});
+
+app.get('/api/invoices', requireAuth, (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1); const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const clauses = []; const params = [];
+  if (req.user.role === 'CUSTOMER') { clauses.push('i.customer_id=?'); params.push(req.user.sub); }
+  if (req.query.status) { clauses.push('i.status=?'); params.push(String(req.query.status).toUpperCase()); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS count FROM invoices i ${where}`).get(...params).count;
+  const invoices = db.prepare(`SELECT i.*, u.name AS customer_name, s.number AS subscription_number FROM invoices i JOIN users u ON u.id=i.customer_id JOIN subscriptions s ON s.id=i.subscription_id ${where} ORDER BY i.id DESC LIMIT ? OFFSET ?`).all(...params, limit, (page - 1) * limit);
+  return res.json({ invoices, page, limit, total, pages: Math.ceil(total / limit) });
+});
+app.get('/api/invoices/:id', requireAuth, (req, res) => {
+  const invoice = db.prepare(`SELECT i.*, u.name AS customer_name, u.email AS customer_email, s.number AS subscription_number FROM invoices i JOIN users u ON u.id=i.customer_id JOIN subscriptions s ON s.id=i.subscription_id WHERE i.id=?`).get(req.params.id);
+  if (!invoice || (req.user.role === 'CUSTOMER' && invoice.customer_id !== req.user.sub)) return notFound(res, 'Invoice');
+  return res.json({ invoice: invoiceWithDetails(invoice) });
+});
+function invoiceAction(action, handler) { app.post(`/api/invoices/:id/${action}`, ...staffOrAdmin, handler); }
+invoiceAction('confirm', (req, res) => { const invoice = db.prepare('SELECT * FROM invoices WHERE id=?').get(req.params.id); if (!invoice) return notFound(res, 'Invoice'); if (invoice.status !== 'DRAFT') return res.status(400).json({ error: 'Only draft invoices can be confirmed.' }); db.prepare("UPDATE invoices SET status='CONFIRMED' WHERE id=?").run(invoice.id); return res.json({ invoice: invoiceWithDetails(db.prepare('SELECT * FROM invoices WHERE id=?').get(invoice.id)) }); });
+invoiceAction('cancel', (req, res) => { const invoice = db.prepare('SELECT * FROM invoices WHERE id=?').get(req.params.id); if (!invoice) return notFound(res, 'Invoice'); if (['PAID', 'CANCELLED'].includes(invoice.status)) return res.status(400).json({ error: 'This invoice cannot be cancelled.' }); db.prepare("UPDATE invoices SET status='CANCELLED' WHERE id=?").run(invoice.id); return res.json({ invoice: invoiceWithDetails(db.prepare('SELECT * FROM invoices WHERE id=?').get(invoice.id)) }); });
+invoiceAction('send', (req, res) => { const invoice = db.prepare('SELECT * FROM invoices WHERE id=?').get(req.params.id); if (!invoice) return notFound(res, 'Invoice'); if (!['DRAFT', 'CONFIRMED'].includes(invoice.status)) return res.status(400).json({ error: 'Only draft or confirmed invoices can be sent.' }); return res.json({ message: 'Invoice marked ready to send.', invoice: invoiceWithDetails(invoice) }); });
+app.post('/api/invoices/:id/payments', ...staffOrAdmin, (req, res) => {
+  const invoice = db.prepare('SELECT * FROM invoices WHERE id=?').get(req.params.id); const amount = asNumber(req.body.amount);
+  if (!invoice) return notFound(res, 'Invoice');
+  if (['CANCELLED', 'PAID'].includes(invoice.status) || !req.body.method?.trim() || amount === null || amount <= 0 || !req.body.date) return res.status(400).json({ error: 'Provide a payment method, positive amount, and payment date for an open invoice.' });
+  const payment = db.transaction(() => {
+    db.prepare('INSERT INTO payments (invoice_id, method, amount, payment_date, note) VALUES (?, ?, ?, ?, ?)').run(invoice.id, req.body.method.trim(), amount, req.body.date, req.body.note || null);
+    const paid = db.prepare('SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE invoice_id=?').get(invoice.id).total;
+    if (paid >= invoice.total) db.prepare("UPDATE invoices SET status='PAID' WHERE id=?").run(invoice.id);
+  });
+  payment(); return res.status(201).json({ invoice: invoiceWithDetails(db.prepare('SELECT * FROM invoices WHERE id=?').get(invoice.id)) });
+});
+app.get('/api/payments', requireAuth, (req, res) => {
+  const where = req.user.role === 'CUSTOMER' ? 'WHERE i.customer_id=?' : '';
+  const params = req.user.role === 'CUSTOMER' ? [req.user.sub] : [];
+  const payments = db.prepare(`SELECT p.*, i.id AS invoice_id, i.status AS invoice_status, u.name AS customer_name FROM payments p JOIN invoices i ON i.id=p.invoice_id JOIN users u ON u.id=i.customer_id ${where} ORDER BY p.payment_date DESC, p.id DESC`).all(...params);
+  return res.json({ payments });
+});
+
+app.get('/api/dashboard', ...staffOrAdmin, (req, res) => {
+  const today = isoDate(new Date());
+  const page = Math.max(1, Number(req.query.page) || 1); const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const filters = ['i.status <> \'PAID\'', 'i.status <> \'CANCELLED\'', 'i.due_date IS NOT NULL', 'i.due_date < ?']; const params = [today];
+  if (req.query.customer_id) { filters.push('i.customer_id=?'); params.push(Number(req.query.customer_id)); }
+  if (req.query.date_from) { filters.push('i.due_date >= ?'); params.push(req.query.date_from); }
+  if (req.query.date_to) { filters.push('i.due_date <= ?'); params.push(req.query.date_to); }
+  const where = `WHERE ${filters.join(' AND ')}`;
+  const active_subscriptions = db.prepare("SELECT COUNT(*) AS count FROM subscriptions WHERE status='ACTIVE'").get().count;
+  const revenue_collected = db.prepare('SELECT COALESCE(SUM(amount), 0) AS total FROM payments').get().total;
+  const outstanding_amount = db.prepare("SELECT COALESCE(SUM(total), 0) AS total FROM invoices WHERE status NOT IN ('PAID', 'CANCELLED')").get().total;
+  const overdue_total = db.prepare(`SELECT COUNT(*) AS count FROM invoices i ${where}`).get(...params).count;
+  const overdue_invoices = db.prepare(`SELECT i.*, u.name AS customer_name, s.number AS subscription_number FROM invoices i JOIN users u ON u.id=i.customer_id JOIN subscriptions s ON s.id=i.subscription_id ${where} ORDER BY i.due_date ASC, i.id DESC LIMIT ? OFFSET ?`).all(...params, limit, (page - 1) * limit);
+  return res.json({ active_subscriptions, revenue_collected, outstanding_amount, overdue_invoices, page, limit, total: overdue_total, pages: Math.ceil(overdue_total / limit) });
+});
+
+app.get('/api/my/subscriptions', requireAuth, requireRole('CUSTOMER'), (req, res) => {
+  const subscriptions = db.prepare(`SELECT s.*, p.name AS plan_name FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.customer_id=? ORDER BY s.id DESC`).all(req.user.sub).map(subscriptionWithLines);
+  return res.json({ subscriptions });
+});
+app.get('/api/my/invoices', requireAuth, requireRole('CUSTOMER'), (req, res) => {
+  const invoices = db.prepare(`SELECT i.*, s.number AS subscription_number FROM invoices i JOIN subscriptions s ON s.id=i.subscription_id WHERE i.customer_id=? ORDER BY i.id DESC`).all(req.user.sub);
+  return res.json({ invoices });
+});
+
 app.use((error, req, res, next) => {
   console.error(error);
   res.status(500).json({ error: 'Internal server error.' });
