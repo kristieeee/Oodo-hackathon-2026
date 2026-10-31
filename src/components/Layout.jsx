@@ -2,8 +2,8 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 const linksByRole = {
-  ADMIN: [['Overview', '/', '◈'], ['Subscriptions', '/subscriptions', '⌁'], ['Invoices', '/invoices', '▤'], ['Customers', '/customers', '◌'], ['Catalog', '/catalog', '◇'], ['Billing rules', '/billing', '⊹'], ['Team', '/team', '♧'], ['Settings', '/settings', '⚙']],
-  STAFF: [['Overview', '/', '◈'], ['Subscriptions', '/subscriptions', '⌁'], ['Invoices', '/invoices', '▤'], ['Customers', '/customers', '◌'], ['Catalog', '/catalog', '◇']],
+  ADMIN: [['Overview', '/', '◈'], ['Subscriptions', '/subscriptions', '⌁'], ['Products', '/products', '◇'], ['Plans', '/plans', '◐'], ['Taxes', '/taxes', '⊹'], ['Discounts', '/discounts', '٪'], ['Templates', '/templates', '▧'], ['Invoices', '/invoices', '▤'], ['Customers', '/customers', '◌'], ['Team', '/team', '♧'], ['Settings', '/settings', '⚙']],
+  STAFF: [['Overview', '/', '◈'], ['Subscriptions', '/subscriptions', '⌁'], ['Products', '/products', '◇'], ['Plans', '/plans', '◐'], ['Taxes', '/taxes', '⊹'], ['Discounts', '/discounts', '٪'], ['Templates', '/templates', '▧'], ['Invoices', '/invoices', '▤'], ['Customers', '/customers', '◌']],
   CUSTOMER: [['My overview', '/', '◈'], ['My subscriptions', '/subscriptions', '⌁'], ['My invoices', '/invoices', '▤']],
 }
 

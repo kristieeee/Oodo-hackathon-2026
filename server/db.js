@@ -168,4 +168,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
 `);
 
+const templateColumns = db.prepare("PRAGMA table_info(quotation_templates)").all();
+if (!templateColumns.some((column) => column.name === 'plan_id')) {
+  db.exec('ALTER TABLE quotation_templates ADD COLUMN plan_id INTEGER REFERENCES plans(id) ON DELETE SET NULL');
+}
+
 module.exports = db;
